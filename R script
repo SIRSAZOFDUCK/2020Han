@@ -1,0 +1,238 @@
+## Association between deprivation and hospital admissions for respiratory disease, before and after COVID pandemic onset, England
+## Jiayin Han, Saran Shantikumar Aug 2022
+
+# Enable repository from ropensci
+options(repos = c(
+  ropensci = 'https://ropensci.r-universe.dev',
+  CRAN = 'https://cloud.r-project.org'))
+
+## SETUP ---------------
+
+# Download and install fingertipsR in R
+install.packages('fingertipsR')
+browseVignettes("fingertipsR")
+
+# Please install any packages below that are required!
+
+rm(list=ls())
+
+setwd("C:/Users/sirsa/OneDrive/Desktop/Warwick/MPH/Projects/2021 Supervising/Jiayin/Analysis")
+
+library(dplyr)
+library(fingertipsR)
+library(ggplot2)
+library(arm)
+library(jtools)
+library(broom)
+library(ggstance)
+
+## PULL DATA ----------------------
+
+#Browse indicators and area types
+inds <- select_indicators()
+areaTypes <- area_types() #165 is CCGs 19/20, 166 is CCGs 20/21, 167 is CCGs 21/22
+
+#set indicator id
+  # 92780 = Hospital admissions for asthma (under 19 years)
+  # 93573 = Emergency hospital admissions for asthma in adults (aged 19 years and over)
+  # 93576 = Emergency hospital admissions for bronchiolitis in children aged under 2 years
+  # 93577 = Emergency hospital admissions for COPD, all ages
+  # 93574 = Emergency hospital admissions for pneumonia
+  # 93575 = Emergency hospital admissions for respiratory disease
+  # 92708 = Population using QOF list size NOT USED
+  # 92309 = Supporting information - % population aged under 18 NOT USED
+
+
+
+indid <- 93575 # Define indicator
+df <- fingertips_data(IndicatorID = indid, AreaTypeID = 167) #Pull data
+
+# Extract 2019/20 data
+df1 <- df %>% filter(Timeperiod == "2019/20") %>%
+  filter(Sex == "Persons") %>%
+  filter(AreaName != "England") %>%
+  select(AreaCode, AreaName, Timeperiod, Value, Denominator)
+
+period <- df1$Timeperiod[1] # Isolate time period
+
+names(df1)[names(df1) == "Value"] <- period # Rename values column by time period
+df1 <- df1 %>% select(-3) # Remove timeperiod column
+
+# Extract 2020/21 data
+df2 <- df %>% filter(Timeperiod == "2020/21") %>%
+  filter(Sex == "Persons") %>%
+  filter(AreaName != "England") %>%
+  select(AreaCode, AreaName, Timeperiod, Value, Denominator)
+
+period <- df2$Timeperiod[1] # Isolate time period
+
+names(df2)[names(df2) == "Value"] <- period # Rename values column by time period
+df2 <- df2 %>% select(-3) # Remove timeperiod column
+
+# Merge two time frames
+df3 <- merge(df1, df2, by = c("AreaCode", "AreaName"))
+
+# Save
+write.csv(df3, file = paste(indid,"_data.csv"))
+
+## ANALYSIS ---------------
+# Reference: https://www.dataquest.io/blog/tutorial-poisson-regression-in-r/
+# Reference: https://rpubs.com/franzbischoff/poisson_regression
+# If the Residual Deviance is greater than the degrees of freedom, then over-dispersion exists
+
+rm(list=ls())
+
+indid <- 93574 # Select indicator
+
+data <- read.csv(paste0(indid," _data.csv")) # Load indicator data
+names(data)[names(data) == "Denominator.x"] <- "pop2019.20" # Rename population columns
+names(data)[names(data) == "Denominator.y"] <- "pop2020.21"
+
+data.imd <- read.csv("IMD_data.csv") %>% select(-1)
+
+# Merge indicator and IMD data
+data <- merge(data, data.imd, by = c("AreaName")) 
+
+# Split IMD into quintiles (note quintile 1 is least deprived)
+data %>%
+  mutate(IMDquintile = ntile(IMD, 5)) -> data #splitinto quintiles
+
+data$IMDquintile <- as.factor(data$IMDquintile) # define as factor variable
+
+# model poisson regression 2019/20
+m1 <- glm(X2019.20 ~ IMDquintile + offset(log(pop2019.20)), data = data, family = quasipoisson(link = "log"))
+summary(m1)
+
+# From https://rpubs.com/franzbischoff/poisson_regression
+cov.m1 <- sandwich::vcovHC(m1, type = "HC0")
+std.err <- sqrt(diag(cov.m1))
+r.est <- cbind(
+  Estimate = coef(m1), "Robust SE" = std.err,
+  "Pr(>|z|)" = 2 * pnorm(abs(coef(m1) / std.err), lower.tail = FALSE),
+  LL = coef(m1) - 1.96 * std.err,
+  UL = coef(m1) + 1.96 * std.err
+)
+
+r.est -> result.pvalues
+
+# Calculate IRRs: # drop the p-value and exp the coefficients
+rexp.est <- exp(r.est[, -3])
+
+# compute the SE for the exp coefficients
+s <- msm::deltamethod(list(
+  ~ exp(x1), ~ exp(x2), ~ exp(x3), ~ exp(x4), ~exp(x5)
+), coef(m1), cov.m1)
+# replace with the new SE's
+rexp.est[, "Robust SE"] <- s
+rexp.est[, "LL"] <- rexp.est[, 1] - 1.96 * s
+rexp.est[, "UL"] <- rexp.est[, 1] + 1.96 * s
+
+rexp.est -> result.irr
+
+# Prepare results to save
+results <- cbind(result.irr, result.pvalues)
+results <- results %>% as.data.frame() %>% select(-c(2,5,6,8,9))
+rownames(results)[1]<-"IMDquintile1"
+results[1, 1] = 1
+results[1, 2] = NA
+results[1, 3] = NA
+results[1, 4] = NA
+
+# Save
+write.csv(results,paste0(indid," _results2019-20.csv"))
+          
+
+# model poisson regression 2020/21
+m1 <- glm(X2020.21 ~ IMDquintile + offset(log(pop2020.21)), data = data, family = quasipoisson(link = "log"))
+summary(m1)
+
+# From reference: https://rpubs.com/franzbischoff/poisson_regression
+cov.m1 <- sandwich::vcovHC(m1, type = "HC0")
+std.err <- sqrt(diag(cov.m1))
+r.est <- cbind(
+  Estimate = coef(m1), "Robust SE" = std.err,
+  "Pr(>|z|)" = 2 * pnorm(abs(coef(m1) / std.err), lower.tail = FALSE),
+  LL = coef(m1) - 1.96 * std.err,
+  UL = coef(m1) + 1.96 * std.err
+)
+
+r.est -> result.pvalues
+
+# Calculate IRRs: # drop the p-value and exp the coefficients
+rexp.est <- exp(r.est[, -3])
+
+# compute the SE for the exp coefficients
+s <- msm::deltamethod(list(
+  ~ exp(x1), ~ exp(x2), ~ exp(x3), ~ exp(x4), ~exp(x5)
+), coef(m1), cov.m1)
+# replace with the new SE's
+rexp.est[, "Robust SE"] <- s
+rexp.est[, "LL"] <- rexp.est[, 1] - 1.96 * s
+rexp.est[, "UL"] <- rexp.est[, 1] + 1.96 * s
+
+rexp.est -> result.irr
+
+# Prepare results to save
+results <- cbind(result.irr, result.pvalues)
+results <- results %>% as.data.frame() %>% select(-c(2,5,6,8,9))
+rownames(results)[1]<-"IMDquintile1"
+results[1, 1] = 1
+results[1, 2] = NA
+results[1, 3] = NA
+results[1, 4] = NA
+
+# Save
+write.csv(results,paste0(indid," _results2020-21.csv"))
+
+
+
+
+# model poisson regression difference between 2019/2020 and 2020/21
+
+# Calculate difference between 20/21 minus 19/20
+data$difference <- data$X2019.20 - data$X2020.21
+
+# Calculate average population btw both years to use as offset
+data$averagepop <- 0.5*(data$pop2019.20 + data$pop2020.21)
+
+m1 <- glm(difference ~ IMDquintile + offset(log(averagepop)), data = data, family = quasipoisson(link = "log"))
+summary(m1)
+
+# From https://rpubs.com/franzbischoff/poisson_regression
+cov.m1 <- sandwich::vcovHC(m1, type = "HC0")
+std.err <- sqrt(diag(cov.m1))
+r.est <- cbind(
+  Estimate = coef(m1), "Robust SE" = std.err,
+  "Pr(>|z|)" = 2 * pnorm(abs(coef(m1) / std.err), lower.tail = FALSE),
+  LL = coef(m1) - 1.96 * std.err,
+  UL = coef(m1) + 1.96 * std.err
+)
+
+r.est -> result.pvalues
+
+# Calculate IRRs: # drop the p-value and exp the coefficients
+rexp.est <- exp(r.est[, -3])
+
+# compute the SE for the exp coefficients
+s <- msm::deltamethod(list(
+  ~ exp(x1), ~ exp(x2), ~ exp(x3), ~ exp(x4), ~exp(x5)
+), coef(m1), cov.m1)
+# replace with the new SE's
+rexp.est[, "Robust SE"] <- s
+rexp.est[, "LL"] <- rexp.est[, 1] - 1.96 * s
+rexp.est[, "UL"] <- rexp.est[, 1] + 1.96 * s
+
+rexp.est -> result.irr
+
+# Prepare results to save
+results <- cbind(result.irr, result.pvalues)
+results <- results %>% as.data.frame() %>% select(-c(2,5,6,8,9))
+rownames(results)[1]<-"IMDquintile1"
+results[1, 1] = 1
+results[1, 2] = NA
+results[1, 3] = NA
+results[1, 4] = NA
+
+# Save
+write.csv(results,paste0(indid," _resultsDifference.csv"))
+          
